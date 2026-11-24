@@ -1,9 +1,9 @@
 from datetime import datetime, timedelta
 import difflib
+import math
 import numpy as np
 import pandas as pd
 import requests
-from scipy.stats import poisson
 import streamlit as st
 
 # ==========================================
@@ -15,7 +15,6 @@ st.set_page_config(
     layout="centered",
 )
 
-# Leer claves de forma segura desde Streamlit Secrets
 try:
     ODDS_API_KEY = st.secrets["ODDS_API_KEY"].strip()
     FOOTBALL_DATA_KEY = st.secrets["FOOTBALL_DATA_KEY"].strip()
@@ -48,6 +47,16 @@ ALIAS_EQUIPOS = {
     "Leicester": "Leicester City",
     "Ipswich": "Ipswich Town",
 }
+
+
+def poisson_pmf(k, mu):
+    if mu <= 0:
+        return 1.0 if k == 0 else 0.0
+    return (mu**k) * math.exp(-mu) / math.factorial(k)
+
+
+def poisson_cdf(k, mu):
+    return sum(poisson_pmf(i, mu) for i in range(int(k) + 1))
 
 
 def normalizar_nombre(nombre):
@@ -85,7 +94,7 @@ def elegir_casa_apuestas(bookmakers):
 # ==========================================
 # FUNCIONES CON CACHÉ (AHORRO DE CRÉDITOS)
 # ==========================================
-@st.cache_data(ttl=21600)  # Guarda datos 6 horas para no gastar créditos
+@st.cache_data(ttl=21600)
 def obtener_fatiga_calendario(fd_key):
     headers = {"X-Auth-Token": fd_key}
     desde = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
@@ -243,9 +252,10 @@ def obtener_cuotas_liga(slug_odds, api_key):
 
 def prob_handicap_asiatico(xg_l, xg_v, linea, es_local):
     max_g = 9
-    matriz = np.outer(
-        poisson.pmf(range(max_g), xg_l), poisson.pmf(range(max_g), xg_v)
-    )
+    p_l = [poisson_pmf(k, xg_l) for k in range(max_g)]
+    p_v = [poisson_pmf(k, xg_v) for k in range(max_g)]
+    matriz = np.outer(p_l, p_v)
+
     sublineas = (
         [linea - 0.25, linea + 0.25]
         if round((linea * 4) % 2) == 1
@@ -371,7 +381,6 @@ with tab_ha:
                 info_extra += f" | ⚠️ {', '.join(fatiga_notas)}"
             st.caption(info_extra)
 
-            # Ajuste manual rápido de bajas clave
             c1, c2 = st.columns(2)
             baja_loc = c1.checkbox(f"Baja clave {loc}", key=f"bl_{ev['id']}")
             baja_vis = c2.checkbox(f"Baja clave {vis}", key=f"bv_{ev['id']}")
@@ -462,7 +471,7 @@ with tab_porteros:
                 )
 
                 esp_sel = paradas_loc if portero_sel == loc else paradas_vis
-                prob_over = (1 - poisson.cdf(int(linea_p), esp_sel)) * 100
+                prob_over = (1 - poisson_cdf(linea_p, esp_sel)) * 100
                 prob_imp_p = (1 / cuota_p) * 100
                 ventaja_p = prob_over - prob_imp_p
 
