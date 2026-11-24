@@ -1,8 +1,8 @@
+import csv
 from datetime import datetime, timedelta
 import difflib
+import io
 import math
-import numpy as np
-import pandas as pd
 import requests
 import streamlit as st
 
@@ -47,6 +47,22 @@ ALIAS_EQUIPOS = {
     "Leicester": "Leicester City",
     "Ipswich": "Ipswich Town",
 }
+
+
+def safe_float(row, key, default):
+    val = row.get(key, "")
+    try:
+        return float(val) if val not in (None, "", "NA") else default
+    except ValueError:
+        return default
+
+
+def limitar(valor, minimo, maximo):
+    return max(minimo, min(maximo, valor))
+
+
+def media(lista):
+    return sum(lista) / len(lista) if lista else 0.0
 
 
 def poisson_pmf(k, mu):
@@ -124,24 +140,45 @@ def obtener_fatiga_calendario(fd_key):
 
 @st.cache_data(ttl=21600)
 def analizar_liga_csv(url_csv):
-    df = pd.read_csv(url_csv).dropna(subset=["HomeTeam", "AwayTeam", "FTHG"])
-    df["HomeNorm"] = df["HomeTeam"].apply(normalizar_nombre)
-    df["AwayNorm"] = df["AwayTeam"].apply(normalizar_nombre)
-
-    equipos = sorted(
-        list(set(df["HomeNorm"].unique()) | set(df["AwayNorm"].unique()))
+    resp = requests.get(
+        url_csv, headers={"User-Agent": "Mozilla/5.0"}, timeout=15
     )
-    media_goles_liga = (df["FTHG"].mean() + df["FTAG"].mean()) / 2.0
-    stats = {}
+    resp.raise_for_status()
+    lector = csv.DictReader(io.StringIO(resp.text))
 
-    for eq in equipos:
-        partidos_eq = df[
-            (df["HomeNorm"] == eq) | (df["AwayNorm"] == eq)
-        ].tail(10)
-        if len(partidos_eq) < 3:
+    filas = []
+    goles_totales = []
+    equipos_set = set()
+
+    for row in lector:
+        h_raw = row.get("HomeTeam", "").strip()
+        a_raw = row.get("AwayTeam", "").strip()
+        fthg = safe_float(row, "FTHG", None)
+        ftag = safe_float(row, "FTAG", None)
+        if not h_raw or not a_raw or fthg is None or ftag is None:
             continue
 
-        pesos = np.linspace(0.55, 1.00, len(partidos_eq))
+        row["HomeNorm"] = normalizar_nombre(h_raw)
+        row["AwayNorm"] = normalizar_nombre(a_raw)
+        filas.append(row)
+        equipos_set.add(row["HomeNorm"])
+        equipos_set.add(row["AwayNorm"])
+        goles_totales.append((fthg + ftag) / 2.0)
+
+    media_goles_liga = media(goles_totales) if goles_totales else 1.35
+    stats = {}
+
+    for eq in sorted(equipos_set):
+        partidos_eq = [
+            r for r in filas if r["HomeNorm"] == eq or r["AwayNorm"] == eq
+        ][-10:]
+        n = len(partidos_eq)
+        if n < 3:
+            continue
+
+        # Pesos decrecientes: el más reciente vale 1.00 y el 10º anterior vale 0.55
+        pesos = [0.55 + (0.45 * i / (n - 1)) for i in range(n)]
+
         xg_favor_list, xg_contra_list = [], []
         sot_favor_list, sot_contra_list = [], []
         tiros_tot_favor = []
@@ -149,21 +186,23 @@ def analizar_liga_csv(url_csv):
         xg_casa, xg_fuera = [], []
         sot_contra_casa, sot_contra_fuera = [], []
 
-        for idx, (_, row) in enumerate(partidos_eq.iterrows()):
+        for idx, row in enumerate(partidos_eq):
             w = pesos[idx]
             es_local = row["HomeNorm"] == eq
 
-            gf = row["FTHG"] if es_local else row["FTAG"]
-            gc = row["FTAG"] if es_local else row["FTHG"]
-            sot_f = row.get("HST", 4) if es_local else row.get("AST", 4)
-            sot_c = row.get("AST", 4) if es_local else row.get("HST", 4)
-            sh_f = row.get("HS", 11) if es_local else row.get("AS", 11)
-            sh_c = row.get("AS", 11) if es_local else row.get("HS", 11)
-            cor_f = row.get("HC", 5) if es_local else row.get("AC", 5)
+            gf = safe_float(row, "FTHG" if es_local else "FTAG", 1.0)
+            gc = safe_float(row, "FTAG" if es_local else "FTHG", 1.0)
+            sot_f = safe_float(row, "HST" if es_local else "AST", 4.0)
+            sot_c = safe_float(row, "AST" if es_local else "HST", 4.0)
+            sh_f = safe_float(row, "HS" if es_local else "AS", 11.0)
+            sh_c = safe_float(row, "AS" if es_local else "HS", 11.0)
+            cor_f = safe_float(row, "HC" if es_local else "AC", 5.0)
 
             factor_rival = 1.0
-            if "AvgH" in df.columns and pd.notna(row.get("AvgH")):
-                cuota_rival = row["AvgA"] if es_local else row["AvgH"]
+            avg_h = safe_float(row, "AvgH", None)
+            avg_a = safe_float(row, "AvgA", None)
+            if avg_h is not None and avg_a is not None:
+                cuota_rival = avg_a if es_local else avg_h
                 if cuota_rival < 1.80:
                     factor_rival = 1.12
                 elif cuota_rival > 3.50:
@@ -189,42 +228,38 @@ def analizar_liga_csv(url_csv):
                 xg_fuera.append(xg_f)
                 sot_contra_fuera.append(sot_c)
 
-        suma_w = np.sum(pesos)
-        xg_f_med = np.sum(xg_favor_list) / suma_w
-        xg_c_med = np.sum(xg_contra_list) / suma_w
-        sot_f_med = np.sum(sot_favor_list) / suma_w
-        sot_c_med = np.sum(sot_contra_list) / suma_w
+        suma_w = sum(pesos)
+        xg_f_med = sum(xg_favor_list) / suma_w
+        xg_c_med = sum(xg_contra_list) / suma_w
+        sot_f_med = sum(sot_favor_list) / suma_w
+        sot_c_med = sum(sot_contra_list) / suma_w
 
-        total_sot_c = max(
-            np.sum(sot_contra_list) / suma_w * len(partidos_eq), 1.0
-        )
-        total_gc = np.sum(goles_contra_list)
-        pct_paradas = np.clip(1.0 - (total_gc / total_sot_c), 0.50, 0.90)
+        total_sot_c = max(sot_c_med * n, 1.0)
+        total_gc = sum(goles_contra_list)
+        pct_paradas = limitar(1.0 - (total_gc / total_sot_c), 0.50, 0.90)
 
-        precision_tiro = np.mean(sot_favor_list) / max(
-            np.mean(tiros_tot_favor), 1.0
-        )
-        pct_fuera_area_est = np.clip((1.0 - precision_tiro) * 65, 22, 55)
+        precision_tiro = media(sot_favor_list) / max(media(tiros_tot_favor), 1.0)
+        pct_fuera_area_est = limitar((1.0 - precision_tiro) * 65.0, 22.0, 55.0)
 
         stats[eq] = {
             "att_home": (
                 0.65 * xg_f_med
-                + 0.35 * (np.mean(xg_casa) if xg_casa else xg_f_med)
+                + 0.35 * (media(xg_casa) if xg_casa else xg_f_med)
             )
             / media_goles_liga,
             "att_away": (
                 0.65 * xg_f_med
-                + 0.35 * (np.mean(xg_fuera) if xg_fuera else xg_f_med)
+                + 0.35 * (media(xg_fuera) if xg_fuera else xg_f_med)
             )
             / media_goles_liga,
             "def_ratio": xg_c_med / media_goles_liga,
-            "corners_med": np.mean(corners_favor),
+            "corners_med": media(corners_favor),
             "sot_favor": sot_f_med,
             "sot_contra_home": (
-                np.mean(sot_contra_casa) if sot_contra_casa else sot_c_med
+                media(sot_contra_casa) if sot_contra_casa else sot_c_med
             ),
             "sot_contra_away": (
-                np.mean(sot_contra_fuera) if sot_contra_fuera else sot_c_med
+                media(sot_contra_fuera) if sot_contra_fuera else sot_c_med
             ),
             "pct_paradas": pct_paradas,
             "pct_fuera_area": pct_fuera_area_est,
@@ -254,7 +289,6 @@ def prob_handicap_asiatico(xg_l, xg_v, linea, es_local):
     max_g = 9
     p_l = [poisson_pmf(k, xg_l) for k in range(max_g)]
     p_v = [poisson_pmf(k, xg_v) for k in range(max_g)]
-    matriz = np.outer(p_l, p_v)
 
     sublineas = (
         [linea - 0.25, linea + 0.25]
@@ -267,11 +301,12 @@ def prob_handicap_asiatico(xg_l, xg_v, linea, es_local):
         w, l = 0.0, 0.0
         for gl in range(max_g):
             for gv in range(max_g):
+                prob_marcador = p_l[gl] * p_v[gv]
                 res = ((gl - gv) if es_local else (gv - gl)) + sl
                 if res > 0:
-                    w += matriz[gl, gv]
+                    w += prob_marcador
                 elif res < 0:
-                    l += matriz[gl, gv]
+                    l += prob_marcador
         p_efectiva += w / max(w + l, 1e-6)
     return p_efectiva / len(sublineas)
 
